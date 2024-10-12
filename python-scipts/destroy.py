@@ -5,7 +5,8 @@ import paramiko
 import json
 import logging
 import sys
-
+import os
+import shutil
 def ssh_command(host, command):
     logging.debug(f"Executing SSH command on {host}: {command}")
     ssh = paramiko.SSHClient()
@@ -42,6 +43,13 @@ def delete_vm(proxmox_ip, vmid):
         return False
     return True
 
+def remove_cluster_directory(directory):
+    try:
+        shutil.rmtree(directory)
+        logging.info(f"Successfully removed the directory: {directory}")
+    except Exception as e:
+        logging.error(f"Failed to remove the directory {directory}: {e}")
+
 def main():
     # Configure logging
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
@@ -77,7 +85,19 @@ def main():
         if not delete_vm(proxmox_ip, vmid):
             logging.error(f"Failed to delete VM {vmid}. You may need to delete it manually.")
 
+
+    # Assuming the directory is named after the cluster and stored in the same parent directory as the JSON file
+    output_dir = os.path.dirname(cluster_map_file)
+    remove_cluster_directory(output_dir)  # Call to remove the directory
+
+
     logging.info(f"Cluster '{cluster_map['cluster_name']}' has been destroyed successfully.")
+
+
+
+
+
+
 
 if __name__ == "__main__":
     main()

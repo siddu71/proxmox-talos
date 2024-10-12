@@ -228,7 +228,7 @@ def main():
     parser.add_argument("--num-workers", type=int, required=True, help="Number of worker nodes")
     parser.add_argument("--worker-ram", type=int, required=True, help="RAM for worker nodes (in MB)")
     parser.add_argument("--worker-cores", type=int, required=True, help="Number of CPU cores for worker nodes")
-    parser.add_argument("--output-dir", default="./talos_cluster", help="Output directory for configurations")
+    parser.add_argument("--output-path", default="./talos_clusters", help="Base path for output directories")
     args = parser.parse_args()
 
     proxmox_ip = args.proxmox_ip
@@ -240,7 +240,13 @@ def main():
     num_workers = args.num_workers
     worker_ram = args.worker_ram
     worker_cores = args.worker_cores
-    output_dir = args.output_dir
+    base_output_path = args.output_path
+
+    # Construct the full path for the cluster-specific output directory
+    output_dir = os.path.join(base_output_path, cluster_name)
+    os.makedirs(output_dir, exist_ok=True)  # Ensure the directory is created
+
+    logging.info(f"Output directory for cluster '{cluster_name}' is set to: {output_dir}")
 
     cluster_map = {
         "cluster_name": cluster_name,
