@@ -358,6 +358,15 @@ def main():
         headers = ["Node Name", "VMID", "IP Address", "Role"]
         print(tabulate(full_table, headers=headers, tablefmt="grid"))
 
+        cluster_map_file = os.path.join(output_dir, f"{cluster_name}_cluster_map.json")
+        try:
+            with open(cluster_map_file, 'w') as f:
+                json.dump(cluster_map, f, indent=4)
+            logging.info(f"Cluster map saved to {cluster_map_file}")
+        except Exception as e:
+            logging.error(f"Failed to save cluster map to JSON file: {e}")
+
+
         logging.info(f"Talos Cluster '{cluster_name}' setup completed successfully!")
 
     except Exception as e:
