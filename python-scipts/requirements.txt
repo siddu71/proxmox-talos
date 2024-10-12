@@ -1,1 +1,3 @@
 paramiko
+tabulate
+argparse
