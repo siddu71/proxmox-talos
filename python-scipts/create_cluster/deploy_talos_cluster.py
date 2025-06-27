@@ -1,136 +1,13 @@
 #!/usr/bin/env python3
 import argparse
-import paramiko
 import subprocess
 import time
 import sys
 import json
 import os
 import logging
-import getpass
 from tabulate import tabulate
-
-def ssh_command(ssh_client, command):
-    """Executes a command on a remote host using an existing Paramiko SSH client."""
-    logging.debug(f"Executing SSH command: {command}")
-    try:
-        stdin, stdout, stderr = ssh_client.exec_command(command)
-        output = stdout.read().decode()
-        error = stderr.read().decode()
-        if error:
-            # Don't log expected "not running" errors as failures
-            if "QEMU guest agent is not running" not in error:
-                logging.error(f"Error executing command: {error.strip()}")
-            return error # Return error to be handled by the caller
-        return output
-    except Exception as e:
-        logging.error(f"SSH command execution failed: {e}")
-        return None
-
-def find_next_available_vmid(ssh_client, proxmox_ip):
-    output = ssh_command(ssh_client, "pvesh get /cluster/nextid")
-    if output is None:
-        logging.error("Failed to get next available VMID.")
-        return None
-    return output.strip()
-
-def clone_vm(ssh_client, proxmox_ip, template_vmid, new_vmid, node_name):
-    logging.info(f"Cloning VM {template_vmid} to new VM {new_vmid} with name '{node_name}'...")
-    command = f"qm clone {template_vmid} {new_vmid} --full --name '{node_name}'"
-    output = ssh_command(ssh_client, command)
-    if output is None or "error" in output.lower():
-        logging.error(f"Failed to clone VM {template_vmid} to {new_vmid}")
-        return False
-    return True
-
-def set_vm_resources(ssh_client, proxmox_ip, vmid, memory, cores):
-    logging.info(f"Setting resources for VM {vmid}: Memory={memory}MB, Cores={cores}...")
-    command = f"qm set {vmid} --memory {memory} --cores {cores}"
-    output = ssh_command(ssh_client, command)
-    if output is None or "error" in output.lower():
-        logging.error(f"Failed to set resources for VM {vmid}")
-        return False
-    return True
-
-def start_vm(ssh_client, proxmox_ip, vmid):
-    logging.info(f"Starting VM {vmid}...")
-    command = f"qm start {vmid}"
-    output = ssh_command(ssh_client, command)
-    if output is None or "error" in output.lower():
-        logging.error(f"Failed to start VM {vmid}")
-        return False
-    return True
-
-def stop_vm(ssh_client, proxmox_ip, vmid):
-    logging.info(f"Stopping VM {vmid}...")
-    command = f"qm stop {vmid}"
-    output = ssh_command(ssh_client, command)
-    if output is None or "error" in output.lower():
-        logging.error(f"Failed to stop VM {vmid}")
-        return False
-    return True
-
-def delete_vm(ssh_client, proxmox_ip, vmid):
-    logging.info(f"Deleting VM {vmid}...")
-    command = f"qm destroy {vmid} --purge"
-    output = ssh_command(ssh_client, command)
-    if output is None or "error" in output.lower():
-        logging.error(f"Failed to delete VM {vmid}")
-        return False
-    return True
-
-def wait_for_vm(ssh_client, proxmox_ip, vmid):
-    logging.info(f"Waiting for VM {vmid} to start...")
-    while True:
-        status_output = ssh_command(ssh_client, f"qm status {vmid}")
-        if status_output is None:
-            logging.error(f"Failed to get status for VM {vmid}")
-            return False
-        if "status: running" in status_output:
-            logging.info(f"VM {vmid} is running.")
-            break
-        else:
-            logging.info(f"VM {vmid} is not running yet. Waiting 5 seconds...")
-            time.sleep(5)
-    return True
-
-def get_vm_ip(ssh_client, proxmox_ip, vmid, timeout=600, interval=10):
-    logging.info(f"Fetching IP address for VM {vmid}...")
-    command = f"qm guest cmd {vmid} network-get-interfaces"
-    elapsed_time = 0
-    while elapsed_time < timeout:
-        output = ssh_command(ssh_client, command)
-        if output is None:
-            logging.info("Command to get IP failed. Waiting...")
-        elif "QEMU guest agent is not running" in output:
-            logging.info("QEMU guest agent is not running yet. Waiting...")
-        else:
-            try:
-                interfaces = json.loads(output)
-                for interface in interfaces:
-                    ip_addresses = interface.get("ip-addresses", [])
-                    for ip_info in ip_addresses:
-                        if ip_info.get("ip-address-type") == "ipv4" and ip_info.get("ip-address") != "127.0.0.1":
-                            ip_address = ip_info.get("ip-address")
-                            logging.info(f"Found IP address: {ip_address}")
-                            return ip_address
-                logging.info("No valid IP address found. Waiting...")
-            except json.JSONDecodeError as e:
-                logging.error(f"Failed to parse network interfaces output: {e}. Waiting...")
-        time.sleep(interval)
-        elapsed_time += interval
-    logging.error(f"Failed to retrieve VM IP address within {timeout} seconds.")
-    return None
-
-def ping_vm(ip_address):
-    logging.info(f"Pinging IP address {ip_address}...")
-    try:
-        subprocess.run(["ping", "-c", "4", ip_address], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        logging.info("Ping successful.")
-        return True
-    except subprocess.CalledProcessError:
-        logging.error(f"Ping to {ip_address} failed.")
-        return False
+import proxmox_api as api
 
 def generate_talos_config(cluster_name, control_plane_ip, output_dir):
     logging.info("Generating Talos configuration...")
@@ -212,6 +89,7 @@ def verify_kubernetes_cluster(kubeconfig, expected_node_count, timeout=600, inte
     logging.error(f"Cluster nodes did not reach expected count of {expected_node_count} within {timeout} seconds.")
     return False
 
+
 def main():
     # Configure logging
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s: %(message)s')
@@ -239,9 +117,26 @@ def main():
     worker_cores = args.worker_cores
     base_output_path = args.output_path
 
-    output_dir = os.path.join(base_output_path, cluster_name)
-    os.makedirs(output_dir, exist_ok=True)
-    logging.info(f"Output directory for cluster '{cluster_name}' is set to: {output_dir}")
+    # --- New Directory Structure Definition ---
+    cluster_root_dir = os.path.join(base_output_path, cluster_name)
+    talos_config_dir = os.path.join(cluster_root_dir, "talos-config")
+    kubeconfig_dir = os.path.join(cluster_root_dir, "kubeconfig")
+    # For future FluxCD GitOps structure
+    bootstrap_dir = os.path.join(cluster_root_dir, "bootstrap", "helm-charts")
+    kustomize_dir = os.path.join(cluster_root_dir, "kustomize", "base")
+
+    # Create all directories
+    dirs_to_create = [
+        cluster_root_dir,
+        talos_config_dir,
+        kubeconfig_dir,
+        bootstrap_dir,
+        kustomize_dir
+    ]
+    for d in dirs_to_create:
+        os.makedirs(d, exist_ok=True)
+
+    logging.info(f"Cluster root directory for '{cluster_name}' is set to: {cluster_root_dir}")
 
     cluster_map = {
         "cluster_name": cluster_name,
@@ -249,98 +144,58 @@ def main():
         "workers": {}
     }
     all_vms = []
-
-    ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
+    ssh = None
     try:
         # Step 0: Establish a persistent SSH connection
-        try:
-            logging.info(f"Attempting to connect to {proxmox_ip} using public key authentication...")
-            ssh.connect(proxmox_ip, username='root', timeout=10)
-            logging.info("SSH connection successful (public key).")
-        except paramiko.AuthenticationException:
-            logging.warning("Public key authentication failed.")
-            try:
-                password = getpass.getpass(f"Enter password for root@{proxmox_ip}: ")
-                logging.info("Retrying with password authentication...")
-                ssh.connect(proxmox_ip, username='root', password=password, timeout=10)
-                logging.info("SSH connection successful (password).")
-            except Exception as e:
-                logging.error(f"SSH connection failed with password: {e}")
-                sys.exit(1)
-        except Exception as e:
-            logging.error(f"An SSH error occurred: {e}")
-            sys.exit(1)
+        ssh = api.connect_to_proxmox(proxmox_ip)
 
         # Main deployment logic starts here
         try:
             # Step 1: Create VMs for Control Planes
             for i in range(num_control_planes):
-                new_vmid = find_next_available_vmid(ssh, proxmox_ip)
-                if new_vmid is None:
-                    raise Exception("Could not find an available VMID.")
+                new_vmid = api.find_next_available_vmid(ssh)
+                if new_vmid is None: raise Exception("Could not find an available VMID.")
                 node_name = f"{cluster_name}-controlplane-{new_vmid}"
                 logging.info(f"Creating control plane node {node_name} with VMID {new_vmid}...")
-                if not clone_vm(ssh, proxmox_ip, template_vmid, new_vmid, node_name):
-                    raise Exception(f"Failed to clone control plane VM {new_vmid} with name {node_name}")
-                if not set_vm_resources(ssh, proxmox_ip, new_vmid, control_plane_ram, control_plane_cores):
-                    raise Exception(f"Failed to set resources for VM {new_vmid}")
-                if not start_vm(ssh, proxmox_ip, new_vmid):
-                    raise Exception(f"Failed to start VM {new_vmid}")
-                if not wait_for_vm(ssh, proxmox_ip, new_vmid):
-                    raise Exception(f"VM {new_vmid} did not start properly")
+                if not api.clone_vm(ssh, template_vmid, new_vmid, node_name): raise Exception(f"Failed to clone control plane VM {new_vmid} with name {node_name}")
+                if not api.set_vm_resources(ssh, new_vmid, control_plane_ram, control_plane_cores): raise Exception(f"Failed to set resources for VM {new_vmid}")
+                if not api.start_vm(ssh, new_vmid): raise Exception(f"Failed to start VM {new_vmid}")
+                if not api.wait_for_vm(ssh, new_vmid): raise Exception(f"VM {new_vmid} did not start properly")
                 cluster_map["controlplanes"][node_name] = {"vmid": new_vmid, "ip": None}
                 all_vms.append(new_vmid)
-
             # Step 1: Create VMs for Workers
             for i in range(num_workers):
-                new_vmid = find_next_available_vmid(ssh, proxmox_ip)
-                if new_vmid is None:
-                    raise Exception("Could not find an available VMID.")
+                new_vmid = api.find_next_available_vmid(ssh)
+                if new_vmid is None: raise Exception("Could not find an available VMID.")
                 node_name = f"{cluster_name}-worker-{new_vmid}"
                 logging.info(f"Creating worker node {node_name} with VMID {new_vmid}...")
-                if not clone_vm(ssh, proxmox_ip, template_vmid, new_vmid, node_name):
-                    raise Exception(f"Failed to clone worker VM {new_vmid}")
-                if not set_vm_resources(ssh, proxmox_ip, new_vmid, worker_ram, worker_cores):
-                    raise Exception(f"Failed to set resources for VM {new_vmid}")
-                if not start_vm(ssh, proxmox_ip, new_vmid):
-                    raise Exception(f"Failed to start VM {new_vmid}")
-                if not wait_for_vm(ssh, proxmox_ip, new_vmid):
-                    raise Exception(f"VM {new_vmid} did not start properly")
+                if not api.clone_vm(ssh, template_vmid, new_vmid, node_name): raise Exception(f"Failed to clone worker VM {new_vmid}")
+                if not api.set_vm_resources(ssh, new_vmid, worker_ram, worker_cores): raise Exception(f"Failed to set resources for VM {new_vmid}")
+                if not api.start_vm(ssh, new_vmid): raise Exception(f"Failed to start VM {new_vmid}")
+                if not api.wait_for_vm(ssh, new_vmid): raise Exception(f"VM {new_vmid} did not start properly")
                 cluster_map["workers"][node_name] = {"vmid": new_vmid, "ip": None}
                 all_vms.append(new_vmid)
-
-            # Step 2: Collect IP Addresses for Control Planes
-            for node_name, node_info in cluster_map["controlplanes"].items():
-                vmid = node_info["vmid"]
-                vm_ip = get_vm_ip(ssh, proxmox_ip, vmid)
-                if vm_ip is None: raise Exception(f"Failed to get IP for VM {vmid}")
-                if not ping_vm(vm_ip): raise Exception(f"Cannot reach VM {vmid} at IP {vm_ip}")
-                cluster_map["controlplanes"][node_name]["ip"] = vm_ip
-
-            # Step 2: Collect IP Addresses for Workers
-            for node_name, node_info in cluster_map["workers"].items():
-                vmid = node_info["vmid"]
-                vm_ip = get_vm_ip(ssh, proxmox_ip, vmid)
-                if vm_ip is None: raise Exception(f"Failed to get IP for VM {vmid}")
-                if not ping_vm(vm_ip): raise Exception(f"Cannot reach VM {vmid} at IP {vm_ip}")
-                cluster_map["workers"][node_name]["ip"] = vm_ip
+            # Step 2: Collect IP Addresses for all nodes
+            for node_type, nodes in [("controlplanes", cluster_map["controlplanes"]), ("workers", cluster_map["workers"])]:
+                for node_name, node_info in nodes.items():
+                    vmid = node_info["vmid"]
+                    vm_ip = api.get_vm_ip(ssh, vmid)
+                    if vm_ip is None: raise Exception(f"Failed to get IP for VM {vmid}")
+                    if not api.ping_vm(vm_ip): raise Exception(f"Cannot reach VM {vmid} at IP {vm_ip}")
+                    cluster_map[node_type][node_name]["ip"] = vm_ip
 
             # Step 3: Generate Talos Configuration
             first_control_plane_ip = next(iter(cluster_map["controlplanes"].values()))["ip"]
-            generate_talos_config(cluster_name, first_control_plane_ip, output_dir)
-            talosconfig = os.path.join(output_dir, "talosconfig")
+            generate_talos_config(cluster_name, first_control_plane_ip, talos_config_dir)
+            talosconfig = os.path.join(talos_config_dir, "talosconfig")
             os.environ['TALOSCONFIG'] = talosconfig
 
-            # Step 4: Apply Configuration to Control Planes
-            controlplane_config_file = os.path.join(output_dir, "controlplane.yaml")
-            for node_name, node_info in cluster_map["controlplanes"].items():
+            # Step 4: Apply Configuration to Nodes
+            controlplane_config_file = os.path.join(talos_config_dir, "controlplane.yaml")
+            for node_info in cluster_map["controlplanes"].values():
                 apply_talos_config(node_info["ip"], controlplane_config_file)
-
-            # Step 4: Apply Configuration to Workers
-            worker_config_file = os.path.join(output_dir, "worker.yaml")
-            for node_name, node_info in cluster_map["workers"].items():
+            worker_config_file = os.path.join(talos_config_dir, "worker.yaml")
+            for node_info in cluster_map["workers"].values():
                 apply_talos_config(node_info["ip"], worker_config_file)
 
             # Step 5: Bootstrap the Cluster
@@ -349,8 +204,8 @@ def main():
             bootstrap_talos(first_control_plane_ip, talosconfig)
 
             # Step 6: Generate Kubeconfig
-            generate_kubeconfig(output_dir)
-            kubeconfig = os.path.join(output_dir, 'kubeconfig')
+            generate_kubeconfig(kubeconfig_dir)
+            kubeconfig = os.path.join(kubeconfig_dir, 'kubeconfig')
 
             # Step 7: Verify Cluster Health
             expected_node_count = num_control_planes + num_workers
@@ -366,24 +221,24 @@ def main():
             headers = ["Node Name", "VMID", "IP Address", "Role"]
             print(tabulate(full_table, headers=headers, tablefmt="grid"))
 
-            cluster_map_file = os.path.join(output_dir, f"{cluster_name}_cluster_map.json")
+            cluster_map_file = os.path.join(talos_config_dir, f"{cluster_name}_cluster_map.json")
             with open(cluster_map_file, 'w') as f:
                 json.dump(cluster_map, f, indent=4)
             logging.info(f"Cluster map saved to {cluster_map_file}")
+            logging.info(f"Kubeconfig available at: {kubeconfig}")
             logging.info(f"Talos Cluster '{cluster_name}' setup completed successfully!")
 
         except Exception as e:
             logging.error(f"An error occurred during deployment: {e}")
             logging.info("Initiating cleanup...")
             for vmid in all_vms:
-                stop_vm(ssh, proxmox_ip, vmid)
-                delete_vm(ssh, proxmox_ip, vmid)
+                api.stop_vm(ssh, vmid)
+                api.delete_vm(ssh, vmid)
             logging.info("Cleanup completed. Exiting.")
             sys.exit(1)
-
     finally:
         # Ensure the SSH connection is closed when the script exits
-        if ssh.get_transport() and ssh.get_transport().is_active():
+        if ssh and ssh.get_transport() and ssh.get_transport().is_active():
             logging.info("Closing SSH connection.")
             ssh.close()
 

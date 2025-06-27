@@ -1,47 +1,12 @@
 #!/usr/bin/env python3
 
 import argparse
-import paramiko
 import json
 import logging
 import sys
 import os
 import shutil
-def ssh_command(host, command):
-    logging.debug(f"Executing SSH command on {host}: {command}")
-    ssh = paramiko.SSHClient()
-    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    try:
-        ssh.connect(host, username='root')
-        stdin, stdout, stderr = ssh.exec_command(command)
-        output = stdout.read().decode()
-        error = stderr.read().decode()
-        ssh.close()
-        if error:
-            logging.error(f"Error executing command on {host}: {error.strip()}")
-            return None
-        return output
-    except Exception as e:
-        logging.error(f"SSH connection failed: {e}")
-        return None
-
-def stop_vm(proxmox_ip, vmid):
-    logging.info(f"Stopping VM {vmid}...")
-    command = f"qm stop {vmid}"
-    output = ssh_command(proxmox_ip, command)
-    if output is None:
-        logging.error(f"Failed to stop VM {vmid}")
-        return False
-    return True
-
-def delete_vm(proxmox_ip, vmid):
-    logging.info(f"Deleting VM {vmid}...")
-    command = f"qm destroy {vmid} --purge"
-    output = ssh_command(proxmox_ip, command)
-    if output is None:
-        logging.error(f"Failed to delete VM {vmid}")
-        return False
-    return True
+import proxmox_api as api
 
 def remove_cluster_directory(directory):
     try:
@@ -77,14 +42,20 @@ def main():
             vmid = node_info["vmid"]
             all_vms.append(vmid)
 
-    # Stop and delete VMs
-    for vmid in all_vms:
-        if not stop_vm(proxmox_ip, vmid):
-            logging.error(f"Failed to stop VM {vmid}. Continuing with next VM.")
-            continue
-        if not delete_vm(proxmox_ip, vmid):
-            logging.error(f"Failed to delete VM {vmid}. You may need to delete it manually.")
-
+    ssh = None
+    try:
+        ssh = api.connect_to_proxmox(proxmox_ip)
+        # Stop and delete VMs
+        for vmid in all_vms:
+            if not api.stop_vm(ssh, vmid):
+                logging.error(f"Failed to stop VM {vmid}. Continuing with next VM.")
+                continue
+            if not api.delete_vm(ssh, vmid):
+                logging.error(f"Failed to delete VM {vmid}. You may need to delete it manually.")
+    finally:
+        if ssh and ssh.get_transport() and ssh.get_transport().is_active():
+            logging.info("Closing SSH connection.")
+            ssh.close()
 
     # Assuming the directory is named after the cluster and stored in the same parent directory as the JSON file
     output_dir = os.path.dirname(cluster_map_file)
@@ -92,12 +63,6 @@ def main():
 
 
     logging.info(f"Cluster '{cluster_map['cluster_name']}' has been destroyed successfully.")
-
-
-
-
-
-
 
 if __name__ == "__main__":
     main()
